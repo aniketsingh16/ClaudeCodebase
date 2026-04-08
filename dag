@@ -1,0 +1,85 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.models import Variable
+from datetime import datetime, timedelta
+import pytz
+from google.cloud import storage
+import zipfile
+import os
+
+storage_client = storage.Client()
+
+# Airflow Variables
+BUCKET_NAME             = Variable.get("gcs_bucket_name_mxo")
+SOURCE_DIRECTORY        = Variable.get("mxo-bkt-source-directory")
+DESTINATION_DIRECTORY   = Variable.get("mxo-bkt-destination-directory")
+
+
+def list_today_zipfiles(**context):
+    ist        = pytz.timezone("Asia/Kolkata")
+    today_date = datetime.now(ist).date()
+    bucket     = storage_client.bucket(BUCKET_NAME)
+    blobs      = bucket.list_blobs(prefix=SOURCE_DIRECTORY)
+
+    today_zips = [
+        blob.name for blob in blobs
+        if blob.name.endswith(".zip") and blob.time_created.date() == today_date
+    ]
+
+    print(f"Found {len(today_zips)} zip file(s) for {today_date}")
+    return today_zips   # Returns a flat list — Airflow XCom serialises this
+
+
+def unzip_blob(blob_name: str):           # receives ONE blob path per task instance
+    bucket      = storage_client.bucket(BUCKET_NAME)
+    blob        = bucket.blob(blob_name)
+    zip_base    = os.path.basename(blob_name)
+    zip_folder  = os.path.splitext(zip_base)[0]
+    dest_prefix = f"{DESTINATION_DIRECTORY}{zip_folder}/"
+
+    with blob.open("rb") as zip_stream:
+        with zipfile.ZipFile(zip_stream) as zf:
+            for zip_info in (zi for zi in zf.infolist() if not zi.is_dir()):
+                dest_blob_name = f"{dest_prefix}{zip_info.filename}"
+                dest_blob      = bucket.blob(dest_blob_name)
+                with zf.open(zip_info) as extracted_file:
+                    dest_blob.upload_from_file(extracted_file)
+
+    print(f"Unzipped: {blob_name} → {dest_prefix}")
+
+
+# Default args
+default_args = {
+    "owner":              "JLR",
+    "depends_on_past":    False,
+    "start_date":         datetime(2026, 1, 1),
+    "email_on_failure":   False,
+    "email_on_retry":     False,
+    "retries":            0,
+    "retry_delay":        timedelta(minutes=5),
+    "execution_timeout":  timedelta(minutes=720),
+}
+
+with DAG(
+    dag_id="daily_unzip_dag2",
+    default_args=default_args,
+    description="Unzip today's zip files from compressed to decompressed folder",
+    schedule_interval="0 19 * * *",     # 7 AM IST = 19:00 UTC previous day
+    catchup=False,
+    max_active_tasks=20,                # ← controls parallelism; tune to your worker count
+    tags=[],
+) as dag:
+
+    # Task 1: list today's zip files → returns ["raw/a.zip", "raw/b.zip", ...]
+    list_task = PythonOperator(
+        task_id="list_today_zipfiles",
+        python_callable=list_today_zipfiles,
+    )
+
+    # Task 2: one task instance per zip file — the correct expand() pattern
+    # .map(lambda x: [x]) converts ["a.zip","b.zip"] → [["a.zip"],["b.zip"]]
+    # so each mapped instance receives exactly ONE blob_name via op_args
+    unzip_task = PythonOperator.partial(
+        task_id="unzip_blob",
+        python_callable=unzip_blob,
+    ).expand(op_args=list_task.output.map(lambda x: [x]))
